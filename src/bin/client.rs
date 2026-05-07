@@ -3,11 +3,34 @@ use std::{env::args, sync::Arc};
 use async_std::{
     io::{BufReadExt, BufReader, stdin},
     net::TcpStream,
+    prelude::FutureExt,
     stream::StreamExt,
+    task,
 };
-use chat_app::{FromClient, utils::ChatResult};
+use chat_app::{
+    FromClient, FromServer,
+    utils::{self, ChatResult},
+};
 
-async fn send_commands(to_server: TcpStream) -> ChatResult<()> {
+async fn handle_replies(from_server: TcpStream) -> ChatResult<()> {
+    let buf_reader = BufReader::new(from_server);
+    let mut reply_stream = utils::receive_as_json(buf_reader);
+    while let Some(reply) = reply_stream.next().await {
+        match reply? {
+            FromServer::Message {
+                group_name,
+                message,
+            } => {
+                println!("message in group {}: {}", group_name, message);
+            }
+            FromServer::Error(msg) => {
+                println!("error from server: {}", msg);
+            }
+        }
+    }
+    Ok(())
+}
+async fn send_commands(mut to_server: TcpStream) -> ChatResult<()> {
     println!(
         "Commands: 
               join GROUP
@@ -22,6 +45,7 @@ async fn send_commands(to_server: TcpStream) -> ChatResult<()> {
             Some(request) => request,
             None => continue,
         };
+        utils::send_as_json(&mut to_server, request).await?;
     }
     Ok(())
 }
@@ -40,11 +64,20 @@ fn parse_command(command: String) -> Option<FromClient> {
                 message: Arc::new(message),
             })
         }
-        _ => None,
+        _ => {
+            eprintln!("invalid command received");
+            None
+        }
     }
 }
-fn main() {
-    let args: Vec<String> = args().skip(1).collect();
-    let command = args.join(" ");
-    println!("{:?}", parse_command(command));
+fn main() -> ChatResult<()> {
+    let address = args().nth(1).expect("usage: client <address>");
+    task::block_on(async {
+        let socket = TcpStream::connect(address).await?;
+        socket.set_nodelay(true)?;
+        let to_server = send_commands(socket.clone());
+        let from_server = handle_replies(socket);
+        from_server.race(to_server).await?;
+        Ok(())
+    })
 }
